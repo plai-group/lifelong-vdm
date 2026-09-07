@@ -1,0 +1,427 @@
+from abc import abstractmethod
+import json
+import os
+import numpy as np
+import torch as th
+from torch.utils.data import DataLoader, Dataset
+from torchvision.transforms import ToTensor
+import torch.distributed as dist
+from pathlib import Path
+import shutil
+from typing import Tuple
+from mpi4py import MPI
+from improved_diffusion.data_sampler import DistributedReplaySampler, DistributedOfflineSampler
+
+from .train_util import get_blob_logdir
+from .test_util import Protect
+from .plaicraft_dataset import ContinuousPlaicraftDataset, SpacedPlaicraftDataset, ChunkedPlaicraftDataset
+from .plaicraft_custom_dataset import PlaicraftCustomDataset
+from .drive_dataset import ContinuousDriveDataset, ChunkedDriveDataset, SpacedDriveDataset
+from .egolife_dataset import ContinuousEgoLifeDataset, SpacedEgoLifeDataset, ChunkedEgoLifeDataset
+
+
+
+video_data_paths_dict = {
+    "ball_stn":            "datasets/ball_stn",
+    "ball_nstn":           "datasets/ball_nstn",
+    "streaming_ball_stn":  "datasets/ball_stn",
+    "streaming_ball_nstn": "datasets/ball_nstn",
+    "wmaze":               "datasets/windows_maze",
+    "streaming_wmaze":     "datasets/windows_maze",
+    "plaicraft":           "datasets/plaicraft",
+    "streaming_plaicraft": "datasets/plaicraft",
+    "drive":               "datasets/drive",
+    "streaming_drive":     "datasets/drive",
+    "egolife":             "datasets/egolife",
+    "streaming_egolife":   "datasets/egolife",
+}
+
+default_T_dict = {
+    "ball_stn":            10,
+    "ball_nstn":           10,
+    "streaming_ball_stn":  10,  # gets reset to 1 for the dataset
+    "streaming_ball_nstn": 10,  # gets reset to 1 for the dataset
+    "wmaze":               20,
+    "streaming_wmaze":     20,
+    "plaicraft":           20,
+    "streaming_plaicraft": 20,
+    "drive":               20,
+    "streaming_drive":     20,
+    "egolife":             20,
+    "streaming_egolife":   20,
+}
+
+default_image_size_dict = {
+    "ball_stn":            32,
+    "ball_nstn":           32,
+    "streaming_ball_stn":  32,
+    "streaming_ball_nstn": 32,
+    "wmaze":               64,
+    "streaming_wmaze":     64,
+    "plaicraft":           160,
+    "streaming_plaicraft": 160,
+    "drive":               64,
+    "streaming_drive":     64,
+    "egolife":             64,
+    "streaming_egolife":   64,
+}
+
+default_full_image_size_dict = {
+    "ball_stn":            (32, 32),
+    "ball_nstn":           (32, 32),
+    "streaming_ball_stn":  (32, 32),
+    "streaming_ball_nstn": (32, 32),
+    "wmaze":               (64, 64),
+    "streaming_wmaze":     (64, 64),
+    "plaicraft":           (96, 160),
+    "streaming_plaicraft": (96, 160),
+    "drive":               (64, 64),
+    "streaming_drive":     (64, 64),
+    "egolife":             (64, 64),
+    "streaming_egolife":   (64, 64),
+}
+
+eval_dataset_configs = {"default": "default", "continuous": "continuous", "chunked": "chunked"}
+
+
+def get_data_path(dataset_name):
+    # If DATA_ROOT environment variable is specified, it is assumed to point at local node storage. If the data is already there,
+    # the dataset objects will read off them. Otherwise, data will be copied from the shared storage as they are retrieved.
+    data_path = video_data_paths_dict[dataset_name]
+    if "DATA_ROOT" in os.environ and os.environ["DATA_ROOT"] != "":
+        data_root = Path(os.environ["DATA_ROOT"])
+        data_path = data_root / data_path
+        data_path.mkdir(parents=True, exist_ok=True)
+    return data_path
+
+
+def load_data(dataset_name, batch_size, T=None, deterministic=False, num_workers=1, return_dataset=False,
+              resume_id='', seed=0, buffer_size=None, n_sequential=1, save_every=None, frame_range=(0, None),
+              extra_iters=0):
+    data_path = get_data_path(dataset_name)
+    T = default_T_dict[dataset_name] if T is None else T
+    shard = MPI.COMM_WORLD.Get_rank()
+    num_shards = MPI.COMM_WORLD.Get_size()
+
+    if dataset_name.startswith("streaming"):
+        deterministic = True
+    if "ball_stn" in dataset_name:
+        dataset = ContinuousBaseDataset(data_path, T=T, seed=0, frame_range=frame_range)  # There is only one video stream
+    elif "ball_nstn" in dataset_name:
+        dataset = ContinuousBaseDataset(data_path, T=T, seed=0, frame_range=frame_range)
+    elif "wmaze" in dataset_name:
+        dataset = ContinuousBaseDataset(data_path, T=T, seed=0, frame_range=frame_range)
+    elif "plaicraft" in dataset_name:
+        dataset = ContinuousPlaicraftDataset(data_path, window_length=T,
+                                             player_names_train=["Alex"],
+                                             player_names_test=["Kyrie"], frame_range=frame_range)
+    elif "drive" in dataset_name:
+        dataset = ContinuousDriveDataset(data_path, window_length=T, frame_range=frame_range)
+    elif "egolife" in dataset_name:
+        dataset = ContinuousEgoLifeDataset(data_path, window_length=T, frame_range=frame_range)
+    else:
+        raise Exception("no dataset", dataset_name)
+
+    if return_dataset:
+        return dataset
+
+    save_path = os.path.join(get_blob_logdir(resume_id), 'replay_state.pt') if dist.get_rank() == 0 else ''
+    if deterministic:
+        sampler = DistributedReplaySampler(dataset, batch_size, buffer_size=buffer_size, seed=seed,
+                                           n_sequential=n_sequential, save_args=dict(path=save_path, every=save_every))
+    else:
+        sampler = DistributedOfflineSampler(dataset, batch_size, seed=seed, extra_iters=extra_iters, save_args=dict(path=save_path, every=save_every))
+
+    if resume_id:
+        load_path = os.path.join(get_blob_logdir(resume_id), 'replay_state.pt')
+        sampler.load_sampler(path=load_path)
+        print(f"starting sampler from data index {sampler.start_index}.")
+
+    batch_size = batch_size // dist.get_world_size()
+    loader = DataLoader(dataset, batch_size=batch_size, num_workers=num_workers, sampler=sampler)
+    # Single pass over the sampler. Returning ends the generator, so the caller's next() raises
+    # StopIteration (a bare `raise StopIteration` inside a generator would surface as RuntimeError).
+    yield from loader
+    return
+
+
+def get_eval_dataset(dataset_name, T=None, seed=0, train=False, eval_dataset_config=eval_dataset_configs["default"],
+                     frame_range=(0, None), spacing_kwargs=dict(n_data=None), custom_clip_path=None):
+    """
+    """
+    data_path = get_data_path(dataset_name)
+    T = default_T_dict[dataset_name] if T is None else T
+    if "ball_stn" in dataset_name:
+        shared_args = dict(dataset_path=data_path, T=T, seed=seed, frame_range=frame_range)
+        if eval_dataset_config == eval_dataset_configs["continuous"]:
+            dataset = ContinuousBaseDataset(**shared_args)
+        else:
+            dataset = ChunkedBaseDataset(**shared_args)
+    elif "ball_nstn" in dataset_name:
+        shared_args = dict(dataset_path=data_path, T=T, seed=seed, frame_range=frame_range)
+        if eval_dataset_config == eval_dataset_configs["continuous"]:
+            dataset = ContinuousBaseDataset(**shared_args)
+        elif eval_dataset_config == eval_dataset_configs["chunked"]:
+            dataset = ChunkedBaseDataset(**shared_args)
+        else:
+            dataset = SpacedBaseDataset(**spacing_kwargs, **shared_args)
+    elif "wmaze" in dataset_name:
+        shared_args = dict(dataset_path=data_path, T=T, seed=seed, frame_range=frame_range)
+        if eval_dataset_config == eval_dataset_configs["continuous"]:
+            dataset = ContinuousBaseDataset(**shared_args)
+        else:
+            if train and eval_dataset_config == eval_dataset_configs["default"]:  # NOTE: Account for the fact that train stream has a mild distribution shift
+                dataset = SpacedBaseDataset(**spacing_kwargs, **shared_args)
+            else:
+                dataset = ChunkedBaseDataset(**shared_args)
+    elif "plaicraft" in dataset_name:
+        shared_args = dict(dataset_path=data_path, window_length=T, frame_range=frame_range,
+                           player_names_train=["Alex"], player_names_test=["Kyrie"])
+        if custom_clip_path is not None:
+            shared_args["dataset_path"] = custom_clip_path
+            del shared_args["player_names_train"]
+            del shared_args["player_names_test"]
+            dataset = PlaicraftCustomDataset(**shared_args)
+        elif eval_dataset_config == eval_dataset_configs["continuous"]:
+            dataset = ContinuousPlaicraftDataset(**shared_args)
+        elif eval_dataset_config == eval_dataset_configs["chunked"]:
+            dataset = ChunkedPlaicraftDataset(**shared_args)
+        else:
+            dataset = SpacedPlaicraftDataset(**spacing_kwargs, **shared_args)
+    elif "drive" in dataset_name:
+        shared_args = dict(dataset_path=data_path, window_length=T, frame_range=frame_range)
+        if eval_dataset_config == eval_dataset_configs["continuous"]:
+            dataset = ContinuousDriveDataset(**shared_args)
+        else:
+            dataset = SpacedDriveDataset(**spacing_kwargs, **shared_args)
+    elif "egolife" in dataset_name:
+        shared_args = dict(dataset_path=data_path, window_length=T, frame_range=frame_range)
+        if eval_dataset_config == eval_dataset_configs["continuous"]:
+            dataset = ContinuousEgoLifeDataset(**shared_args)
+        elif eval_dataset_config == eval_dataset_configs["chunked"]:
+            dataset = ChunkedEgoLifeDataset(**shared_args)
+        else:
+            dataset = SpacedEgoLifeDataset(**spacing_kwargs, **shared_args)
+        # else:
+        #     dataset = ChunkedEgoLifeDataset(**shared_args)
+    else:
+        raise Exception("no dataset", dataset_name)
+    if not train:
+        dataset.set_test()
+    return dataset
+
+
+def get_train_dataset(dataset_name, T=None, seed=0):
+    return load_data(dataset_name, T=T, batch_size=None, seed=0, return_dataset=True)
+
+
+def get_test_dataset(dataset_name, T=None, seed=0, n_data=None):
+    data_path = get_data_path(dataset_name)
+    T = default_T_dict[dataset_name] if T is None else T
+    if "ball_stn" in dataset_name:
+        dataset = ChunkedBaseDataset(data_path, T=T, seed=seed)
+    elif "ball_nstn" in dataset_name:
+        dataset = SpacedBaseDataset(n_data, data_path, T=T, seed=seed)
+    elif "wmaze" in dataset_name:
+        dataset = ChunkedBaseDataset(data_path, T=T, seed=seed)
+    elif "plaicraft" in dataset_name:
+        dataset = SpacedPlaicraftDataset(n_data, data_path, window_length=T,
+                                         player_names_train=["Alex"],
+                                         player_names_test=["Kyrie"])
+    else:
+        raise Exception("no dataset", dataset_name)
+    dataset.set_test()
+    return dataset
+
+
+def get_vis_dataset(dataset_name, T=None, seed=0):
+    data_path = get_data_path(dataset_name)
+    T = default_T_dict[dataset_name] if T is None else T
+    if "ball_stn" in dataset_name:
+        dataset = ChunkedBaseDataset(data_path, T=T, seed=seed)
+    elif "ball_nstn" in dataset_name:
+        dataset = ChunkedBaseDataset(data_path, T=T, seed=seed)
+    elif "wmaze" in dataset_name:
+        dataset = ChunkedBaseDataset(data_path, T=T, seed=seed)
+    elif "plaicraft" in dataset_name:
+        dataset = ChunkedPlaicraftDataset(data_path, window_length=T,
+                                          player_names_train=["Alex"],
+                                          player_names_test=["Kyrie"])
+    else:
+        raise Exception("no dataset", dataset_name)
+    dataset.set_test()
+    return dataset
+
+
+class ContinuousBaseDataset(Dataset):
+    """
+    A dataset that takes one long video saved in multiple .npy files and returns a size T sliding window of
+    video frames indexed by the location of the sliding window's first frame in the video.
+
+    __getitem__ returns data of shape <1 x T x ...>
+    self.chunk_size denotes the number of frames present in each npy file.
+    T denotes the number of frames that the dataset should return to the model per item.
+    """
+    def __init__(self, dataset_path, T=1, seed=0, frame_range=(0, None)):
+        super().__init__()
+        self.T = T
+        self.path = Path(dataset_path)
+        self.is_test = False
+
+        config = self.get_config(self.path / 'config.json')
+        self.T_total = config['T_total']
+        self.chunk_size = config['chunk_size']
+        # assert self.T_total % self.T == 0
+        assert self.T_total % self.chunk_size == 0
+        # assert self.chunk_size % self.T == 0
+
+        self.frame_range = frame_range
+        if self.frame_range[1] is None:
+            self.frame_range = (self.frame_range[0], self.T_total)
+
+        self.train_path = self.path / 'train' / str(seed)
+        self.test_path = self.path / 'test' / str(seed)
+
+    def __len__(self):
+        return (self.frame_range[1]-self.frame_range[0]) - (self.T - 1)
+
+    def __getitem__(self, idx):
+        paths = self.getitem_paths(idx)
+        self.cache_files(paths)
+        try:
+            video = self.loaditem(paths)
+        except Exception as e:
+            print(f"Failed on loading {paths}")
+            raise e
+        video = self.get_video_subsequence(video, idx)
+        frames = self.postprocess_video(video)
+        absolute_index_map = th.arange(idx, idx+self.T)
+        return frames, absolute_index_map
+
+    def getitem_paths(self, idx):
+        adjusted_idx = self.frame_range[0] + idx
+        chunk_idxs = [adjusted_idx // self.chunk_size]
+        if (adjusted_idx % self.chunk_size) + self.T > self.chunk_size:
+            chunk_idxs.append(adjusted_idx // self.chunk_size + 1)
+        return [(self.test_path if self.is_test else self.train_path) / f"{cidx}.npy" for cidx in chunk_idxs]
+
+    def loaditem(self, paths):
+        loaded = [np.load(path) for path in paths]
+        return np.concatenate(loaded, axis=0)
+
+    def postprocess_video(self, video):
+        byte_to_tensor = lambda x: ToTensor()(x)
+        video = th.stack([byte_to_tensor(frame).float() for frame in video])
+        video = 2 * video - 1
+        return video
+
+    def cache_files(self, paths):
+        # Given a path to a dataset item, makes sure that the item is cached in the temporary directory.
+        for path in paths:
+            with Protect(path):
+                if not path.exists():
+                    path.parent.mkdir(parents=True, exist_ok=True)
+                    src_path = self.get_src_path(path)
+                    shutil.copyfile(str(src_path), str(path))
+
+    @staticmethod
+    def get_src_path(path):
+        """ Returns the source path to a file. This function is mainly used to handle SLURM_TMPDIR on ComputeCanada.
+            If DATA_ROOT is defined as an environment variable, the datasets are copied to it as they are accessed. This function is called
+            when we need the source path from a given path under DATA_ROOT.
+        """
+        if "DATA_ROOT" in os.environ and os.environ["DATA_ROOT"] != "":
+            # Verify that the path is under
+            data_root = Path(os.environ["DATA_ROOT"])
+            assert data_root in path.parents, f"Expected dataset item path ({path}) to be located under the data root ({data_root})."
+            src_path = Path(*path.parts[len(data_root.parts):]) # drops the data_root part from the path, to get the relative path to the source file.
+            return src_path
+        return path
+
+    @staticmethod
+    def get_config(path):
+        if "DATA_ROOT" in os.environ and os.environ["DATA_ROOT"] != "":
+            # Verify that the path is under
+            data_root = Path(os.environ["DATA_ROOT"])
+            assert data_root in path.parents, f"Expected dataset item path ({path}) to be located under the data root ({data_root})."
+            path = Path(*path.parts[len(data_root.parts):]) # drops the data_root part from the path, to get the relative path to the source file.
+        return json.load(open(path))
+
+    def set_train(self):
+        self.is_test = False
+        print('setting train mode')
+
+    def set_test(self):
+        self.is_test = True
+        print('setting test mode')
+
+    def get_video_subsequence(self, video, idx):
+        # Take a subsequence of the video.
+        adjusted_idx = self.frame_range[0] + idx
+        start_i = adjusted_idx % self.chunk_size
+        video = video[start_i:start_i+self.T]
+        assert len(video) == self.T
+        return video
+
+
+class ChunkedBaseDataset(ContinuousBaseDataset):
+    """
+    A dataset that takes one long video saved in multiple .npy files and returns a size T video frame
+    subsequence indexed by the location of the sliding window's first frame in the video divided by T.
+
+    __getitem__ returns data of shape <1 x T x ...>
+    self.chunk_size denotes the number of frames present in each npy file.
+    T denotes the number of frames that the dataset should return to the model per item.
+    """
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        assert self.T_total % self.T == 0
+        assert self.chunk_size % self.T == 0
+
+    def __len__(self):
+        return (self.frame_range[1]-self.frame_range[0]) // self.T
+
+    def getitem_paths(self, idx):
+        chunk_idxs = [(self.frame_range[0] + idx * self.T) // self.chunk_size]
+        return [(self.test_path if self.is_test else self.train_path) / f"{cidx}.npy" for cidx in chunk_idxs]
+
+    def get_video_subsequence(self, video, idx):
+        # Take a subsequence of the video.
+        start_i = (self.frame_range[0] + idx * self.T) % self.chunk_size
+        video = video[start_i:start_i+self.T]
+        assert len(video) == self.T
+        return video
+
+
+class SpacedBaseDataset(ContinuousBaseDataset):
+    """
+    A dataset that takes one long video saved in multiple .npy files and returns a size T video frame
+    subsequence indexed by the location of the sliding window's first frame in the video divided by T.
+
+    __getitem__ returns data of shape <1 x T x ...>
+    self.chunk_size denotes the number of frames present in each npy file.
+    T denotes the number of frames that the dataset should return to the model per item.
+    """
+    def __init__(self, n_data: int, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.n_data = n_data
+
+        self.spacing = (self.frame_range[1]-self.frame_range[0]) // self.n_data
+        assert self.T_total % self.T == 0
+        assert self.chunk_size % self.T == 0
+        assert self.spacing % self.T == 0
+        assert 0<=self.frame_range[0] and self.frame_range[0]+self.T<self.frame_range[1]
+
+    def __len__(self):
+        return self.n_data
+
+    def getitem_paths(self, idx):
+        chunk_idxs = [(self.frame_range[0] + idx * self.spacing) // self.chunk_size]
+        return [(self.test_path if self.is_test else self.train_path) / f"{cidx}.npy" for cidx in chunk_idxs]
+
+    def get_video_subsequence(self, video, idx):
+        # Take a subsequence of the video.
+        start_i = (self.frame_range[0] + idx * self.spacing) % self.chunk_size
+        video = video[start_i:start_i+self.T]
+        assert len(video) == self.T
+        return video

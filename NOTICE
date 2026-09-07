@@ -1,0 +1,25 @@
+This repository is licensed under the MIT License (see LICENSE), with the
+exceptions listed below.
+
+Provenance: this codebase descends from OpenAI's improved-diffusion
+(https://github.com/openai/improved-diffusion, MIT) via PLAI Group's
+flexible-video-diffusion-modeling
+(https://github.com/plai-group/flexible-video-diffusion-modeling, MIT).
+
+Exceptions and third-party components:
+
+- improved_diffusion/vdt.py is adapted from VDT (https://github.com/RERV/VDT),
+  which is licensed under CC BY-NC 4.0 and itself derives from Meta's DiT
+  (https://github.com/facebookresearch/DiT, CC BY-NC 4.0). This file is NOT
+  covered by the MIT License; it remains subject to the terms of
+  CC BY-NC 4.0 (non-commercial use only).
+
+- improved_diffusion/frechet_video_distance.py is adapted from Google Research
+  (https://github.com/google-research/google-research/tree/master/frechet_video_distance)
+  and is licensed under the Apache License 2.0 (notice retained in the file
+  header).
+
+- The JEDi metric (scripts/video_jedi.py) uses the videojedi package
+  (https://github.com/oooolga/JEDi, Apache-2.0), which downloads Meta's V-JEPA
+  model weights at runtime; those weights are subject to Meta's own license
+  terms.

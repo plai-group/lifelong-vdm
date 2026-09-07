@@ -1,0 +1,34 @@
+# Byte-compiled / packaging
+__pycache__/
+*.py[cod]
+*.egg-info/
+
+# Experiment artifacts
+checkpoints/
+results/
+wandb/
+summarized/
+plots/
+tmp/
+.tfhub_cache/
+
+# Datasets: track only the generation/encoding scripts and their docs/manifest, not the data
+datasets/*
+!datasets/*.py
+!datasets/*.sh
+!datasets/*.md
+!datasets/*.csv
+
+# Large files and misc
+*.pth.tar
+*.zip
+/*.png
+*.mp4
+.DS_Store
+.vscode/
+.ipynb_checkpoints/
+
+scripts/*
+!scripts/video_*
+!scripts/npy_to_video.py
+TODO.md

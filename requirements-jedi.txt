@@ -1,0 +1,12 @@
+# Environment for the JEDi metric (scripts/video_jedi.py).
+# Install this in a SEPARATE conda env / virtualenv from requirements.txt:
+# videojedi's torch stack conflicts with the TensorFlow version used for FVD.
+#
+#   conda create -n jedi python=3.10 -y && conda activate jedi
+#   pip install -r requirements-jedi.txt
+#
+# On first use, videojedi auto-downloads the V-JEPA weights (~10GB) into
+# $JEDI_MODEL_DIR (default: ~/.cache/videojedi).
+torch==2.4.1
+numpy==1.26.4
+videojedi==1.1.0
