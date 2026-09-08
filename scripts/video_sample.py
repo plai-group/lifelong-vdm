@@ -1,6 +1,6 @@
 """
-Generate a large batch of image samples from a model and save them as a large
-numpy array. This can be used to produce samples for FID evaluation.
+Sample video continuations from a checkpoint, conditioned on the first n_obs frames of each
+evaluation video, and save them as one uint8 .npy file per video for the metric scripts.
 
 Sample Command
 python scripts/video_sample.py checkpoints/p9lrebju/ema_0.9999_050000.pt --T=50 --stop_index=3 --max_frames=10 --n_obs=5 --sampling_scheme=autoreg --batch_size=1 --eval_on_train=True --sampler=heun-80-inf-0-1-1000-0.002-7-100
@@ -9,50 +9,41 @@ python scripts/video_sample.py checkpoints/p9lrebju/ema_0.9999_050000.pt --T=50 
 import argparse
 import os
 import json
-from pathlib import Path
-from PIL import Image
 
 import numpy as np
 import torch as th
 
-from improved_diffusion import dist_util
-from improved_diffusion.script_util import (
-    model_and_diffusion_defaults,
-    create_model_and_diffusion,
-    args_to_dict,
-    str2bool,
-)
-from improved_diffusion.test_util import get_model_results_path, get_eval_run_identifier, Protect
+from improved_diffusion.script_util import str2bool
+from improved_diffusion.test_util import get_model_results_path, get_eval_run_identifier, Protect, load_model_from_checkpoint
 from improved_diffusion.sampling_schemes import sampling_schemes
-from improved_diffusion.video_datasets import get_eval_dataset, eval_dataset_configs
+from improved_diffusion.video_datasets import get_eval_dataset, eval_dataset_configs, default_T_dict
 
 
 @th.no_grad()
-def sample_video(args, model, diffusion, batch, just_get_indices=False):
+def sample_video(args, model, diffusion, batch):
     """
     batch has a shape of BxTxCxHxW where
     B: batch size
     T: video length
-    CxWxH: image size
+    CxHxW: frame size (SD latents if the model was trained with --diffusion_space=latent)
+    Returns a BxTxC'xH'xW' pixel-space tensor: the first n_obs frames copied from batch
+    (decoded if needed), the rest generated.
     """
     B, T, C, H, W = batch.shape
     samples = th.zeros_like(batch)
     samples[:, :args.n_obs] = batch[:, :args.n_obs]
 
-    # Observation-level samples
+    # Pixel-space (decoded) copy of samples; allocated once the decoded frame shape is known
     visualized_samples = None
 
-    # Intilise sampling scheme
-    optimal_schedule_path = None if args.optimality is None else args.eval_dir / "optimal_schedule.pt"
+    # Initialise sampling scheme
     frame_indices_iterator = iter(sampling_schemes[args.sampling_scheme](
         video_length=T, num_obs=args.n_obs,
         max_frames=args.max_frames, step_size=args.max_latent_frames,
-        optimal_schedule_path=optimal_schedule_path,
     ))
 
-    indices_used = []
     while True:
-        frame_indices_iterator.set_videos(samples.to(args.device))  # ignored for non-adaptive sampling schemes
+        frame_indices_iterator.set_videos(samples.to(args.device))  # non-adaptive schemes ignore the video contents but still take the batch size from it
         try:
             obs_frame_indices, latent_frame_indices = next(frame_indices_iterator)
         except StopIteration:
@@ -64,82 +55,75 @@ def sample_video(args, model, diffusion, batch, just_get_indices=False):
         obs_mask = th.cat([th.ones_like(th.tensor(obs_frame_indices)),
                               th.zeros_like(th.tensor(latent_frame_indices))], dim=1).view(B, -1, 1, 1, 1).float()
         latent_mask = 1 - obs_mask
-        if just_get_indices:
-            local_samples = th.stack([batch[i, ind] for i, ind in enumerate(frame_indices)])
-        else:
-            # Prepare masks
-            print(f"{'Frame indices':20}: {frame_indices[0].cpu().numpy()}.")
-            print(f"{'Observation mask':20}: {obs_mask[0].cpu().int().numpy().squeeze()}")
-            print(f"{'Latent mask':20}: {latent_mask[0].cpu().int().numpy().squeeze()}")
-            print("-" * 40)
-            # Move tensors to the correct device
-            x0, obs_mask, latent_mask, frame_indices = (t.to(args.device) for t in [x0, obs_mask, latent_mask, frame_indices])
-            # Run the network
-            sampler, *sampler_args = args.sampler.split('-')
-            if sampler == "ddpm":
-                sample_func = diffusion.p_sample_loop
-                sampler_kwargs = {}
-            elif sampler == "ddim":
-                sample_func = diffusion.ddim_sample_loop
-                sampler_kwargs = {}
-            elif sampler == "heun":
-                sample_func = diffusion.heun_sample
-                (S_churn, S_max, S_min, S_noise,
-                 sigma_max, sigma_min, rho, num_steps) = sampler_args
-                sampler_kwargs = dict(
-                    S_churn=float(S_churn), S_max=float(S_max),
-                    S_min=float(S_min), S_noise=float(S_noise),
-                    sigma_max=float(sigma_max), sigma_min=float(sigma_min),
-                    rho=int(rho), num_steps=int(num_steps),
-                    visualize_reverse_diffusion=args.visualize_reverse_diffusion,
-                )
-            print('sample_func', sample_func)
-            local_samples, history = sample_func(
-                model, x0.shape, clip_denoised=args.clip_denoised,
-                model_kwargs=dict(frame_indices=frame_indices,
-                                  x0=x0,
-                                  obs_mask=obs_mask,
-                                  latent_mask=latent_mask),
-                latent_mask=latent_mask,
-                return_attn_weights=False,
-                decode_chunk_size=args.decode_chunk_size,
-                **sampler_kwargs,
+        print(f"{'Frame indices':20}: {frame_indices[0].cpu().numpy()}.")
+        print(f"{'Observation mask':20}: {obs_mask[0].cpu().int().numpy().squeeze()}")
+        print(f"{'Latent mask':20}: {latent_mask[0].cpu().int().numpy().squeeze()}")
+        print("-" * 40)
+        # Move tensors to the correct device
+        x0, obs_mask, latent_mask, frame_indices = (t.to(args.device) for t in [x0, obs_mask, latent_mask, frame_indices])
+        # Run the network
+        sampler, *sampler_args = args.sampler.split('-')
+        if sampler == "ddpm":
+            sample_func = diffusion.p_sample_loop
+            sampler_kwargs = {}
+        elif sampler == "ddim":
+            sample_func = diffusion.ddim_sample_loop
+            sampler_kwargs = {}
+        elif sampler == "heun":
+            sample_func = diffusion.heun_sample
+            (S_churn, S_max, S_min, S_noise,
+             sigma_max, sigma_min, rho, num_steps) = sampler_args
+            sampler_kwargs = dict(
+                S_churn=float(S_churn), S_max=float(S_max),
+                S_min=float(S_min), S_noise=float(S_noise),
+                sigma_max=float(sigma_max), sigma_min=float(sigma_min),
+                rho=int(rho), num_steps=int(num_steps),
+                visualize_reverse_diffusion=args.visualize_reverse_diffusion,
             )
-            if args.visualize_reverse_diffusion:
-                os.makedirs(args.eval_dir / "history", exist_ok=True)
-                for i, item in enumerate(history):
-                    timestep, item = item
-                    drange = [-1, 1]
-                    item = (item[0].cpu().clamp(*drange).numpy() - drange[0]) / (drange[1] - drange[0]) * 255
-                    item = item.astype(np.uint8)
-                    th.save(item, args.eval_dir / "history" / f"timestep_{timestep}.pt")
+        else:
+            raise ValueError(f"Unknown sampler {sampler!r} in --sampler={args.sampler}; expected ddpm, ddim, or heun-...")
+        local_samples, history = sample_func(
+            model, x0.shape, clip_denoised=args.clip_denoised,
+            model_kwargs=dict(frame_indices=frame_indices,
+                              x0=x0,
+                              obs_mask=obs_mask,
+                              latent_mask=latent_mask),
+            latent_mask=latent_mask,
+            return_attn_weights=False,
+            decode_chunk_size=args.decode_chunk_size,
+            **sampler_kwargs,
+        )
+        if args.visualize_reverse_diffusion:
+            os.makedirs(args.eval_dir / "history", exist_ok=True)
+            for i, item in enumerate(history):
+                timestep, item = item
+                drange = [-1, 1]
+                item = (item[0].cpu().clamp(*drange).numpy() - drange[0]) / (drange[1] - drange[0]) * 255
+                item = item.astype(np.uint8)
+                th.save(item, args.eval_dir / "history" / f"timestep_{timestep}.pt")
 
-            if isinstance(local_samples, tuple):
-                # Edge case: Encoded sample
-                visualized_local_samples = local_samples[1]
-                local_samples = local_samples[0].to(x0.dtype)
+        if isinstance(local_samples, tuple):
+            # p_sample_loop/heun_sample return (raw sample, decoded sample); identical in pixel space
+            visualized_local_samples = local_samples[1]
+            local_samples = local_samples[0].to(x0.dtype)
+        else:
+            # sampler returned a bare, already-decoded tensor
+            visualized_local_samples = local_samples.to(x0.dtype)
+
+        if visualized_samples is None:
+            if local_samples.shape == visualized_local_samples.shape:
+                decoded_obs_batch = batch[:, :args.n_obs].to(batch.device)
             else:
-                # No encoded samples
-                visualized_local_samples = local_samples.to(x0.dtype)
-
-            if visualized_samples is None:
-                if local_samples.shape == visualized_local_samples.shape:
-                    decoded_obs_batch = batch[:, :args.n_obs].to(batch.device)
-                else:
-                    decoded_obs_batch = diffusion.decode(batch[:, :args.n_obs].to(th.float16),
-                                                         chunk_size=args.decode_chunk_size).to(batch.device)
-                C_d, H_d, W_d = decoded_obs_batch.shape[2:]
-                visualized_samples = th.zeros(B, T, *decoded_obs_batch.shape[2:]).to(batch.device).to(batch.dtype)
-                visualized_samples[:, :args.n_obs] = decoded_obs_batch
-
-            print('local samples', local_samples.min(), local_samples.max())
+                decoded_obs_batch = diffusion.decode(batch[:, :args.n_obs].to(th.float16),
+                                                     chunk_size=args.decode_chunk_size).to(batch.device)
+            visualized_samples = th.zeros(B, T, *decoded_obs_batch.shape[2:]).to(batch.device).to(batch.dtype)
+            visualized_samples[:, :args.n_obs] = decoded_obs_batch
 
         # Fill in the generated frames
         for i, li in enumerate(latent_frame_indices):
             samples[i, li] = local_samples[i, -len(li):].cpu().to(samples.dtype)
             visualized_samples[i, li] = visualized_local_samples[i, -len(li):].cpu().to(visualized_samples.dtype)
-        indices_used.append((obs_frame_indices, latent_frame_indices))
-    return visualized_samples, indices_used
+    return visualized_samples
 
 
 def main(args, model, diffusion, dataset, samples_prefix):
@@ -149,12 +133,11 @@ def main(args, model, diffusion, dataset, samples_prefix):
         not_done = not_done[args.batch_size:]
         output_filenames = [args.eval_dir / samples_prefix / f"sample_{i:04d}-{args.sample_idx}.npy" for i in batch_indices]
         todo = [not p.exists() for p in output_filenames]
-        # todo = [True for p in output_filenames]
         if not any(todo):
             print(f"Nothing to do for the batches {min(batch_indices)} - {max(batch_indices)}, sample #{args.sample_idx}.")
             continue
         batch = th.stack([dataset[i][0] for i in batch_indices])
-        samples, _ = sample_video(args, model, diffusion, batch)
+        samples = sample_video(args, model, diffusion, batch)
         drange = [-1, 1]
         samples = (samples.clamp(*drange).numpy() - drange[0]) / (drange[1] - drange[0]) * 255
         samples = samples.astype(np.uint8)
@@ -170,38 +153,20 @@ def main_outer(args):
         args.num_sampled_videos = len(args.indices)
     print(f"Sampling for indices {args.start_index} to {args.stop_index}.")
 
-    # Load the checkpoint (state dictionary and config)
-    data = dist_util.load_state_dict(args.checkpoint_path, map_location="cpu")
-    state_dict = data["state_dict"]
-    model_args = data["config"]
-    model_args.update({"use_ddim": args.sampler == "ddim",
-                       "timestep_respacing": args.timestep_respacing})
-    model_args["diffusion_space_kwargs"]["enable_decoding"] = True
-    model_args = argparse.Namespace(**model_args)
-    if not hasattr(model_args, "model_type"):  # HACK: To get it to work with models trained before this was introduced
-        is_vdt = "model_name" in model_args
-        model_args.model_type = "vdt" if is_vdt else "unet"
-        if is_vdt and not hasattr(model_args, "input_size"):
-            model_args.input_size = model_args.image_size
-        if is_vdt and not hasattr(model_args, "patch_size"):
-            model_args.patch_size = 2
-    model, diffusion = create_model_and_diffusion(model_type=model_args.model_type,
-        **args_to_dict(model_args, model_and_diffusion_defaults(model_type=model_args.model_type).keys())
-    )
-    model.load_state_dict(state_dict)
-    model = model.to(args.device)
-    model.eval()
-    if hasattr(model_args, "image_size"):
-        args.image_size = model_args.image_size
+    # Build the model and diffusion from the checkpoint (eval mode) and recover its training config
+    model, diffusion, model_args = load_model_from_checkpoint(
+        args.checkpoint_path, args.device, timestep_respacing=args.timestep_respacing)
     if args.max_frames is None:
         args.max_frames = model_args.max_frames
     if args.max_latent_frames is None:
-        args.max_latent_frames = args.max_frames // 2 
+        args.max_latent_frames = args.max_frames // 2
+    if args.T is None:  # resolve before it is written into the eval directory name
+        args.T = default_T_dict[model_args.dataset]
     if model_args.diffusion_space == "latent":
         args.clip_denoised = False
 
-    # Prepare samples directory
-    if args.custom_clip_path is not None:  # For custom visualizations, make unique folders
+    # Work out the output directory (created below)
+    if args.custom_clip_path is not None:  # custom clips get their own folder, named after the clip's parent directory
         args.eval_dir = get_model_results_path(args) / args.custom_clip_path.split('/')[-2] / get_eval_run_identifier(args)
     else:
         args.eval_dir = get_model_results_path(args) / get_eval_run_identifier(args)
@@ -236,31 +201,27 @@ def create_sampling_parser():
     parser.add_argument("--start_index", type=int, default=0)
     parser.add_argument("--stop_index", type=int, required=True)
     parser.add_argument("--num_sampled_videos", type=int, default=None,
-                        help="Total number of samples (default: args.stop_index-args.start_index)")
+                        help="Total number of videos sampled across all start/stop_index shards; sets the spacing of the eval dataset (default: stop_index-start_index)")
     parser.add_argument("--sampling_scheme", required=True, choices=sampling_schemes.keys())
     parser.add_argument("--batch_size", type=int, default=8)
     parser.add_argument("--eval_dir", type=str, default=None)
-    parser.add_argument("--n_obs", type=int, default=36, help="Number of observed frames at the beginning of the video. The rest are sampled.")
-    parser.add_argument("--T", type=int, default=None, help="Length of the videos. If not specified, it will be inferred from the dataset.")
+    parser.add_argument("--n_obs", type=int, required=True, help="Number of observed frames at the beginning of the video. The rest are sampled.")
+    parser.add_argument("--T", type=int, default=None, help="Length of the videos. Defaults to the training dataset's default length (video_datasets.default_T_dict).")
     parser.add_argument("--max_frames", type=int, default=None,
                         help="Denoted K in the paper. Maximum number of (observed or latent) frames input to the model at once. Defaults to what the model was trained with.")
     parser.add_argument("--max_latent_frames", type=int, default=None, help="Number of frames to sample in each stage. Defaults to max_frames/2.")
     parser.add_argument("--sampler", type=str, default="heun-80-inf-0-1-1000-0.002-7-50")
-    parser.add_argument("--use_ddim", type=str2bool, default=False)
     parser.add_argument("--visualize_reverse_diffusion", type=str2bool, default=False)
     parser.add_argument("--eval_on_train", type=str2bool, default=False)
     parser.add_argument("--timestep_respacing", type=str, default="")
-    parser.add_argument("--clip_denoised", type=str2bool, default=True, help="If true, diffusion model generates data between [-1,1].")
-    parser.add_argument("--sample_idx", type=int, default=0, help="Sampled images will have this specific index. Used for sampling multiple videos with the same observations.")
-    parser.add_argument("--optimality", type=str, default=None,
-                        choices=["linspace-t", "random-t", "linspace-t-force-nearby", "random-t-force-nearby"],
-                        help="Type of optimised sampling scheme to use for choosing observed frames. By default uses non-optimized sampling scheme. The optimal indices should be computed before use via video_optimal_schedule.py.")
+    parser.add_argument("--clip_denoised", type=str2bool, default=True, help="If true, diffusion model generates data between [-1,1]. Forced to False for latent-space checkpoints.")
+    parser.add_argument("--sample_idx", type=int, default=0, help="Suffix of the output filename (sample_<video>-<sample_idx>.npy). Use different values to draw multiple samples from the same observations.")
     parser.add_argument("--device", default="cuda" if th.cuda.is_available() else "cpu")
 
     parser.add_argument("--eval_dataset_config", type=str, default=eval_dataset_configs["default"], choices=list(eval_dataset_configs.keys()))
-    parser.add_argument("--lower_frame_range", type=int, default=0, help="Lower bound of frame index used for SpacedDatasets.")
-    parser.add_argument("--upper_frame_range", type=int, default=None, help="Upper bound of frame index used for SpacedDatasets.")
-    parser.add_argument("--decode_chunk_size", type=int, default=10, help="How many frames to pass to VAE decoder (PLAICraft only).")
+    parser.add_argument("--lower_frame_range", type=int, default=0, help="Lower bound of the frame index range the eval dataset draws from.")
+    parser.add_argument("--upper_frame_range", type=int, default=None, help="Upper bound (exclusive) of the frame index range the eval dataset draws from. None: end of stream.")
+    parser.add_argument("--decode_chunk_size", type=int, default=10, help="How many frames to pass to VAE decoder (latent-space models only).")
     parser.add_argument("--custom_clip_path", type=str, default=None, help="Used to create samples from custom PLAICraft video clips.")
     return parser
 

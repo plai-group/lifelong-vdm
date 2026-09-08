@@ -44,7 +44,9 @@
 # Export them from a private/incognito window that is closed afterwards without logging out: cookies
 # taken from a normal browser session are rotated by the browser within hours, and YouTube then
 # rejects them mid-build ("account cookies are no longer valid"). yt-dlp rewrites the cookie file on
-# every run. The bot check is intermittent, so re-running without cookies is also worth a try.
+# every run. The check is tied to the egress IP and is intermittent: it can hit one cluster node and
+# not another, and cookies do not always lift it, so running the download from a different machine
+# (with or without cookies) is often the quickest fix. Only the download is host-sensitive.
 # Alternatively download the two videos elsewhere and place them in SAVE_DIR as wmaze_src_v1.<ext>
 # and wmaze_src_v2.<ext> (Video 1 must be the 300x240 rendition); present downloads are skipped.
 # Every step is skipped when its output already exists and is complete (the frame count of every

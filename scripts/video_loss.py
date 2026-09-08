@@ -6,23 +6,15 @@ python scripts/video_loss.py checkpoints/p9lrebju/ema_0.9999_050000.pt --eval_di
 """
 
 import argparse
-import os
-import json
 from pathlib import Path
-from PIL import Image
 from tqdm import tqdm
 
 import numpy as np
 import torch as th
 
 from improved_diffusion import dist_util
-from improved_diffusion.script_util import (
-    model_and_diffusion_defaults,
-    create_model_and_diffusion,
-    args_to_dict,
-    str2bool,
-)
-from improved_diffusion.test_util import get_model_results_path, get_eval_run_identifier, Protect
+from improved_diffusion.script_util import str2bool
+from improved_diffusion.test_util import load_model_from_checkpoint
 from improved_diffusion.sampling_schemes import sampling_schemes
 from improved_diffusion.video_datasets import get_eval_dataset, eval_dataset_configs
 from improved_diffusion.resample import create_named_schedule_sampler
@@ -37,7 +29,7 @@ def compute_loss(batch, args, model, diffusion, schedule_sampler, trials=10):
             video_length=T, num_obs=args.n_obs,
             max_frames=args.max_frames, step_size=args.max_latent_frames,
         ))
-        frame_indices_iterator.set_videos(batch)  # ignored for non-adaptive sampling schemes
+        frame_indices_iterator.set_videos(batch)  # non-adaptive schemes ignore the video contents but still take the batch size from it
         for obs_frame_indices, latent_frame_indices in frame_indices_iterator:
             frame_indices = th.cat([th.tensor(obs_frame_indices), th.tensor(latent_frame_indices)], dim=1).long()
             x0 = th.stack([batch[i, fi] for i, fi in enumerate(frame_indices)], dim=0).clone()
@@ -79,43 +71,23 @@ def main(args):
     if loss_save_path.exists():
         loss = np.loadtxt(loss_save_path).squeeze()
         print(f"Losses are already computed: {loss}")
-        exit()
+        return
     loss_save_path.parent.mkdir(parents=True, exist_ok=True)
     args.indices = list(range(args.start_index, args.stop_index))
     if args.num_sampled_videos is None:
         args.num_sampled_videos = len(args.indices)
-    print(f"Sampling for indices {args.start_index} to {args.stop_index}.")
+    print(f"Computing loss for indices {args.start_index} to {args.stop_index}.")
 
-    # Load the checkpoint (state dictionary and config)
-    data = dist_util.load_state_dict(args.checkpoint_path, map_location="cpu")
-    state_dict = data["state_dict"]
-    model_args = data["config"]
-    model_args.update({"use_ddim": args.sampler == "ddim",
-                       "timestep_respacing": args.timestep_respacing})
-    model_args["diffusion_space_kwargs"]["enable_decoding"] = True
-    model_args = argparse.Namespace(**model_args)
-    if not hasattr(model_args, "model_type"):  # HACK: To get it to work with models trained before this was introduced
-        is_vdt = "model_name" in model_args
-        model_args.model_type = "vdt" if is_vdt else "unet"
-        if is_vdt and not hasattr(model_args, "input_size"):
-            model_args.input_size = model_args.image_size
-        if is_vdt and not hasattr(model_args, "patch_size"):
-            model_args.patch_size = 2
-    model, diffusion = create_model_and_diffusion(model_type=model_args.model_type,
-        **args_to_dict(model_args, model_and_diffusion_defaults(model_type=model_args.model_type).keys())
-    )
-    model.load_state_dict(state_dict)
-    model = model.to(args.device)
-    model.eval()
+    # Build the model and diffusion from the checkpoint (eval mode) and recover its training config
+    model, diffusion, model_args = load_model_from_checkpoint(
+        args.checkpoint_path, args.device, timestep_respacing=args.timestep_respacing)
     schedule_sampler = create_named_schedule_sampler(model_args.schedule_sampler, diffusion)
-    if hasattr(model_args, "image_size"):
-        args.image_size = model_args.image_size
     if args.max_frames is None:
         args.max_frames = model_args.max_frames
     if args.max_latent_frames is None:
         args.max_latent_frames = args.max_frames // 2
 
-    # Load the dataset (to get observations from)
+    # Load the evaluation videos (first n_obs frames are observed, the rest are scored)
     eval_dataset_args = dict(dataset_name=model_args.dataset, T=args.T, train=args.eval_on_train,
                              eval_dataset_config=args.eval_dataset_config, spacing_kwargs=dict(n_data=args.num_sampled_videos),
                              frame_range=(args.lower_frame_range, args.upper_frame_range))
@@ -144,23 +116,22 @@ def create_sampling_parser():
     parser.add_argument("--start_index", type=int, default=0)
     parser.add_argument("--stop_index", type=int, required=True)
     parser.add_argument("--num_sampled_videos", type=int, default=None,
-                        help="Total number of samples (default: args.stop_index-args.start_index)")
+                        help="Total number of videos in the spaced eval dataset; must match the value given to video_sample.py (default: stop_index-start_index)")
     parser.add_argument("--batch_size", type=int, default=8)
-    parser.add_argument("--eval_dir", type=str, default=None)
-    parser.add_argument("--n_obs", type=int, default=36, help="Number of observed frames at the beginning of the video. The rest are sampled.")
-    parser.add_argument("--T", type=int, default=None, help="Length of the videos. If not specified, it will be inferred from the dataset.")
+    parser.add_argument("--eval_dir", type=str, required=True)
+    parser.add_argument("--n_obs", type=int, required=True, help="Number of observed frames at the beginning of the video. The diffusion loss is evaluated on the rest.")
+    parser.add_argument("--T", type=int, default=None, help="Length of the videos. Defaults to the training dataset's default length (video_datasets.default_T_dict).")
     parser.add_argument("--max_frames", type=int, default=None,
                         help="Denoted K in the paper. Maximum number of (observed or latent) frames input to the model at once. Defaults to what the model was trained with.")
-    parser.add_argument("--max_latent_frames", type=int, default=None, help="Number of frames to sample in each stage. Defaults to max_frames/2.")
-    parser.add_argument("--sampler", type=str, default="heun-80-inf-0-1-1000-0.002-7-50")
+    parser.add_argument("--max_latent_frames", type=int, default=None, help="Number of latent frames scored in each stage. Defaults to max_frames/2.")
     parser.add_argument("--eval_on_train", type=str2bool, default=False)
     parser.add_argument("--timestep_respacing", type=str, default="")
-    parser.add_argument("--seed", type=int, default=0, help="seed")
+    parser.add_argument("--seed", type=int, default=0, help="Tag for the output filename (loss-<trials>-<seed>.txt); does not seed any RNG.")
     parser.add_argument("--device", default="cuda" if th.cuda.is_available() else "cpu")
 
     parser.add_argument("--eval_dataset_config", type=str, default=eval_dataset_configs["default"], choices=list(eval_dataset_configs.keys()))
-    parser.add_argument("--lower_frame_range", type=int, default=0, help="Lower bound of frame index used for SpacedDatasets.")
-    parser.add_argument("--upper_frame_range", type=int, default=None, help="Upper bound of frame index used for SpacedDatasets.")
+    parser.add_argument("--lower_frame_range", type=int, default=0, help="Lower bound of the frame index range the eval dataset draws from.")
+    parser.add_argument("--upper_frame_range", type=int, default=None, help="Upper bound (exclusive) of the frame index range the eval dataset draws from. None: end of stream.")
     parser.add_argument("--decode_chunk_size", type=int, default=10)
     parser.add_argument("--trials", type=int, default=10)
     return parser

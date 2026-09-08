@@ -25,7 +25,7 @@ Each Hub dataset card documents the file format and includes a standalone loadin
 ### Download
 
 ```bash
-pip install -U huggingface_hub
+# huggingface_hub comes from requirements.txt; do not `pip install -U` it (diffusers 0.26 needs huggingface_hub < 0.26)
 python datasets/download.py ball_stn drive          # -> datasets/ball_stn, datasets/drive
 python datasets/download.py --all                   # the four hosted datasets, ≈172 GB
 python datasets/download.py drive --split test --no_mp4
@@ -138,8 +138,8 @@ python scripts/video_sample.py checkpoints/<id>/<ckpt>.pt --T=50 --stop_index=10
     --max_frames=10 --n_obs=5 --sampling_scheme=autoreg --batch_size=50 \
     --sampler=heun-80-inf-0-1-1000-0.002-7-50
 
-# 2. Render sample grids to mp4/gif
-python scripts/video_make_mp4.py --eval_dir=<eval_dir> --do_n=8
+# 2. Render sample grids to mp4/gif (ground truth is included by default, so pass the number of sampled videos)
+python scripts/video_make_mp4.py --eval_dir=<eval_dir> --do_n=8 --num_sampled_videos=1000
 
 # 3. Metrics
 python scripts/video_fvd.py    --eval_dir=<eval_dir> --num_videos=1000   # FVD + KVD
