@@ -1,14 +1,17 @@
 # Lifelong Learning of Video Diffusion Models From a Single Video Stream
 
-Datasets and code for **"Lifelong Learning of Video Diffusion Models From a Single Video Stream"**
+This repository contains the datasets and code for **"Lifelong Learning of Video Diffusion Models From a Single Video Stream"**
 (ECCV 2026 Workshop on How to Build Effective World Models for Embodied AI).
 [arXiv](https://arxiv.org/abs/2406.04814) · [OpenReview](https://openreview.net/forum?id=oW6PbzOHHa) · [Datasets on the Hugging Face Hub](https://huggingface.co/jason-yoo-108)
 
+Each dataset is one continuous video stream whose training split is one million consecutive frames.
+The code supports training autoregressive video diffusion models in an offline fashion (on randomly sampled short video subsequences) and in a lifelong fashion (sliding window of video subsequences from beginning to end).
+
 ## Datasets
 
-Five datasets, each a single continuous video stream of one million consecutive training frames,
-in increasing order of complexity. Four are hosted on the Hugging Face Hub in exactly the layout the
-loaders read; Lifelong 3D Maze is built by a script because its source videos cannot be redistributed.
+The table below presents these datasets from the simplest dataset to the most complex.
+Four of the five are on the Hugging Face Hub in the directory layout the loaders expect.
+We can't redistribute the source videos for Lifelong 3D Maze, so that one is built locally with a script.
 
 | Dataset | `--dataset` | Train / test frames | Model input | Download |
 |---|---|---|---|---|
@@ -18,35 +21,33 @@ loaders read; Lifelong 3D Maze is built by a script because its source videos ca
 | Lifelong Drive | `drive` | 1M / 100k | 64x64x4 latents (512x512 source), 20 fps | [jason-yoo-108/lifelong-drive](https://huggingface.co/datasets/jason-yoo-108/lifelong-drive) |
 | Lifelong PLAICraft | `plaicraft` | 1M / 500k | 160x96x4 latents (1280x768 source), 10 fps | [jason-yoo-108/lifelong-plaicraft](https://huggingface.co/datasets/jason-yoo-108/lifelong-plaicraft) |
 
-Each dataset also has a `streaming_` variant (e.g. `streaming_ball_stn`) that presents the frames to the model in order (see Training).
-Drive and PLAICraft are stored as SDXL VAE latents (`madebyollin/sdxl-vae-fp16-fix`, scale 0.13025).
-Each Hub dataset card documents the file format and includes a standalone loading snippet.
+Drive and PLAICraft are stored as SDXL VAE latents rather than pixels. Each dataset card on the Hub
+describes the file format and has a short loading snippet, so the data can be used without this repository.
 
 ### Download
 
+The download script only needs `huggingface_hub` (refer to the Installation section).
+
 ```bash
-# huggingface_hub comes from requirements.txt; do not `pip install -U` it (diffusers 0.26 needs huggingface_hub < 0.26)
 python datasets/download.py ball_stn drive          # -> datasets/ball_stn, datasets/drive
 python datasets/download.py --all                   # the four hosted datasets, ≈172 GB
-python datasets/download.py drive --split test --no_mp4
+python datasets/download.py drive --split test --no_mp4   # one split only; --no_mp4 skips Drive's 512x512 source video and keeps the latents
 ```
 
-The loaders read `datasets/<name>` relative to the repository root. For PLAICraft, the train stream
-is player "Alex" and the test stream is player "Kyrie"; the loader orders sessions with the bundled
-`global_database.db`, and `--upper_frame_range=1000000` reproduces the paper's 1M-frame train stream.
+The code's dataloaders read datasets placed at `datasets/<name>` relative to the repository root.
 
-### Lifelong 3D Maze
+#### Notes on Lifelong 3D Maze
 
-`datasets/preprocess_wmaze.sh` downloads the two 10-hour Windows 3D Maze YouTube videos with `yt-dlp`, crops, rescales and concatenates them to 64x64 at 20 fps with `ffmpeg`, and writes the train and test streams as 500-frame npy chunks.
+`datasets/preprocess_wmaze.sh` downloads the two 10-hour Windows 3D Maze YouTube videos with `yt-dlp`, then crops, rescales and concatenates them into a 64x64, 20 fps stream with `ffmpeg`. It writes the train and test streams as 500-frame npy chunks.
 
 ```bash
 bash datasets/preprocess_wmaze.sh        # needs a current yt-dlp, ffmpeg, opencv-python; ~40 GB scratch (freed at the end) + 136 GB output
-python datasets/verify_wmaze.py          # reports how many chunks are bit-identical to the paper's data
+python datasets/verify_wmaze.py          # compares your rebuild with the paper's data; YouTube re-encodes, so expect small differences
 ```
 
 ## Code
 
-This repository trains autoregressive video diffusion models (U-Net and VDT backbones) from a single continuous, autocorrelated video stream under offline learning, experience replay lifelong learning, and naive AdamW-based lifelong learning.
+The code trains autoregressive video diffusion models with U-Net or VDT backbones under three regimes: offline training, lifelong learning with an experience-replay buffer (ER), and lifelong learning with no replay.
 It builds on [flexible-video-diffusion-modeling](https://github.com/plai-group/flexible-video-diffusion-modeling) (FDM), which in turn builds on OpenAI's [improved-diffusion](https://github.com/openai/improved-diffusion).
 
 ### Installation
@@ -59,9 +60,10 @@ pip install -r requirements.txt
 pip install -e .
 ```
 
-`mpi4py` is installed through conda rather than pip so that it comes bundled with a matching MPI
-runtime. The MPICH 3.3.2 pin is deliberate: it initializes cleanly as a single process under SLURM's
-`srun`, whereas newer MPICH builds and conda's library-less `external_*` stubs did not work for us.
+`mpi4py` is installed through conda rather than pip so that it comes bundled with a matching MPI runtime.
+<!-- The MPICH 3.3.2 pin is deliberate: it initializes cleanly as a single process under SLURM's `srun`, whereas newer MPICH builds and conda's library-less `external_*` stubs did not work for us. -->
+
+Run all commands from the repository root.
 
 **JEDi metric only:** `scripts/video_jedi.py` needs a *separate* environment because
 `videojedi`'s torch stack conflicts with the TensorFlow version used for FVD:
@@ -74,9 +76,11 @@ pip install -r requirements-jedi.txt
 
 ### Training
 
-Entrypoints: `scripts/video_train.py` (U-Net) and `scripts/video_train_vdt.py` (VDT).
-Both share the same CLI; the VDT script additionally takes `--model_name` (`VDT-S`/`VDT-SM`/`VDT-M`) and `--patch_size`.
-The training regime is selected by the dataset name and the replay-buffer flags:
+There are two training scripts, `scripts/video_train.py` for the U-Net and `scripts/video_train_vdt.py` for VDT.
+They take the same flags, except the VDT script also needs `--model_name` (`VDT-S`, `VDT-SM` or `VDT-M`) and `--patch_size`.
+`--dataset=<name>` samples windows i.i.d. from the whole stream.
+`--dataset=streaming_<name>` reads the
+same files but walks through them in order, one frame per step. The replay-buffer flags then decide whether the model also gets a buffer:
 
 | Regime | Description | Flags |
 |---|---|---|
@@ -84,11 +88,11 @@ The training regime is selected by the dataset name and the replay-buffer flags:
 | Lifelong Learning (ER) | in-order stream + reservoir-sampled fixed-size replay buffer | `--dataset=streaming_<name> --ltm_size=<buffer windows> --n_sample_stm=<live slots> --batch_size=<B>` |
 | Streaming (no replay) | in-order stream, most recent frames only | `--dataset=streaming_<name> --batch_size=<B>` (defaults to `--ltm_size=0 --n_sample_stm=<batch size>`) |
 
-With a `streaming_` dataset the model receives a sliding window that advances one frame per step.
-`--n_sample_stm` of the `--batch_size` slots hold the current window; the remaining slots are sampled
-from a reservoir-sampled replay buffer of `--ltm_size` window-start indices. Each replayed slot is a
-full `--max_frames`-frame window, so the buffer covers `ltm_size × max_frames` frames of video, which
-is how the paper quotes buffer sizes in hours:
+With a `streaming_` dataset the model sees a sliding window that advances one frame per step.
+`--n_sample_stm` of the `--batch_size` slots hold the current window. The rest are drawn from a replay
+buffer of `--ltm_size` window-start indices, maintained by reservoir sampling. Each replayed slot is a
+full `--max_frames` window, so the buffer covers `ltm_size × max_frames` frames, which is how the
+paper quotes buffer sizes in hours:
 
 | Dataset | `--ltm_size` | K (`--max_frames`) | fps | Buffer |
 |---|---|---|---|---|
@@ -97,9 +101,8 @@ is how the paper quotes buffer sizes in hours:
 | Drive | 10000 | 20 | 20 | 2.8 h |
 | PLAICraft | 20000 | 10 | 10 | 5.6 h |
 
-Checkpoints are written to `checkpoints/<wandb run id>/`; resume a run with `--resume_id=<wandb run id>` and use `--unobserve` to log offline. The commands below run on a single GPU; for `N` GPUs prefix a command with `mpiexec -n N`, or `srun --mpi=pmi2 -n N` under SLURM, keeping `--batch_size` divisible by `N`.
-
-Example run commands are presented here.
+Checkpoints are written to `checkpoints/<wandb run id>/`; resume a run with `--resume_id=<wandb run id>`.
+The example commands below run on a single GPU; for `N` GPUs prefix a command with `mpiexec -n N`, or `srun --mpi=pmi2 -n N` under SLURM, keeping `--batch_size` divisible by `N`.
 
 **Lifelong Bouncing Balls (`ball_stn`)**
 
@@ -130,7 +133,7 @@ python scripts/video_train.py --dataset=streaming_drive --num_res_blocks=1 --num
 
 ### Evaluation
 
-The evaluation pipeline is: sample videos from a checkpoint, then score them.
+Evaluation has two steps: sample continuations from a checkpoint, then score the samples.
 
 ```bash
 # 1. Autoregressively sample continuations (writes .npy samples + model_config.json)
@@ -138,11 +141,11 @@ python scripts/video_sample.py checkpoints/<id>/<ckpt>.pt --T=50 --stop_index=10
     --max_frames=10 --n_obs=5 --sampling_scheme=autoreg --batch_size=50 \
     --sampler=heun-80-inf-0-1-1000-0.002-7-50
 
-# 2. Render sample grids to mp4/gif (ground truth is included by default, so pass the number of sampled videos)
+# 2. Render sample grids to mp4/gif. Ground truth is shown alongside, so the script needs to know how many videos step 1 generated
 python scripts/video_make_mp4.py --eval_dir=<eval_dir> --do_n=8 --num_sampled_videos=1000
 
 # 3. Metrics
-python scripts/video_fvd.py    --eval_dir=<eval_dir> --num_videos=1000   # FVD + KVD
+python scripts/video_fvd.py    --eval_dir=<eval_dir> --num_videos=1000   # FVD
 python scripts/video_jedi.py   --eval_dir=<eval_dir> --num_videos=1000   # JEDi (jedi env)
 python scripts/video_loss.py   checkpoints/<id>/<ckpt>.pt --eval_dir=<...> --stop_index=1000 ...  # diffusion loss
 python scripts/video_minade.py --eval_dir=<eval_dir> --num_videos=1000   # minADE + ColorKL (balls only)
@@ -154,8 +157,7 @@ and the metric scripts read their configuration back from that directory name an
 `model_config.json`.
 
 Evaluation datasets come in three configurations (`--eval_dataset_config`): `continuous`
-(sliding window over every frame), `chunked` (non-overlapping windows), and `default`
-(dataset-specific choice used in the paper, typically evenly spaced windows).
+(sliding window over every frame), `chunked` (non-overlapping windows), and `default`.
 
 ### Configuration
 
@@ -165,15 +167,12 @@ Evaluation datasets come in three configurations (`--eval_dataset_config`): `con
 | `DATA_ROOT` | Optional. Node-local storage root; dataset files are staged there as they are accessed (useful on clusters). |
 | `JEDI_MODEL_DIR` | Optional. Where `videojedi` caches the V-JEPA weights (~10GB, auto-downloaded on first JEDi run). Default: `~/.cache/videojedi`. |
 
-Run all commands from the repository root: `datasets/`, `checkpoints/`, and `results/` are resolved
-relative to the working directory.
-
 ### Repository layout
 
 ```
 scripts/               Training, sampling, and evaluation entrypoints
 improved_diffusion/    Model, diffusion process, datasets, samplers, training loop
-datasets/              Dataset generation files
+datasets/              Download and build scripts; downloaded data lives in datasets/<name>
 checkpoints/           Created at runtime; one directory per wandb run id
 results/               Created by video_sample.py; metric outputs live next to samples
 ```

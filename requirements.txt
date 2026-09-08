@@ -8,7 +8,7 @@ numpy==1.26.4
 scipy==1.12.0
 blobfile==2.1.1
 tqdm==4.66.2
-wandb[media]==0.29.0  # [media] pulls moviepy, needed for logging sample videos
+wandb[media]==0.25.0  # [media] pulls moviepy, needed for logging sample videos; newest wandb that accepts protobuf 3.x (see tensorflow note below)
 filelock==3.13.1
 imageio==2.34.0
 matplotlib==3.8.4
@@ -29,3 +29,4 @@ lpips==0.1.4
 # TensorFlow is only needed for FVD/KVD evaluation (scripts/video_fvd.py).
 tensorflow==2.8.0
 tensorflow-hub==0.12.0
+protobuf==3.20.3  # tensorflow 2.8.0's generated protos fail to import under protobuf>=4 ("Descriptors cannot be created directly")
